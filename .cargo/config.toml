@@ -1,6 +1,6 @@
 [build]
 target = "aarch64-unknown-none-softfloat"
-rustflags = ["-C", "link-arg=-Tscripts/m1s.ld"]
 
 [target.aarch64-unknown-none-softfloat]
+rustflags = ["-C", "link-arg=-Tscripts/m1s.ld"]
 runner="tools/run_qemu.sh"
