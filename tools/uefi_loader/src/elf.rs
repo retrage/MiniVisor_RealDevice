@@ -77,6 +77,10 @@ impl Elf64Header {
             remaining: self.get_num_of_program_header(),
         }
     }
+
+    pub const fn get_entry_point(&self) -> u64 {
+        self.e_entry
+    }
 }
 
 impl Iterator for Elf64ProgramHeaderIter {

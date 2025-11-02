@@ -22,18 +22,18 @@ pub fn get_currentel() -> u64 {
     currentel
 }
 
-fn boot(dtb_entry: &ConfigTableEntry) -> ! {
+fn boot(elf_base: usize, entry_point: usize, dtb_entry: &ConfigTableEntry) -> ! {
     let dtb_ptr = dtb_entry.address as *const u8;
     info!("Booting with DTB at address {:p}", dtb_ptr as *const u8);
-    // TODO: Determine the actual size of the DTB.
-    // SAFETY: We assume the DTB pointer is valid.
-    let dtb_slice = unsafe { core::slice::from_raw_parts(dtb_ptr, 0x10000) };
-    info!(
-        "DTB slice at {:p}, length {}",
-        dtb_slice.as_ptr(),
-        dtb_slice.len()
-    );
-    loop {}
+
+    let argv: [*const u8; 3] = [dtb_ptr, elf_base as *const u8, core::ptr::null()];
+    let argc = argv.len() - 1;
+
+    // Jump to the ELF entry point with function signature `extern "C" fn main(argc: usize, argv: *const *const u8) -> usize`
+    let entry_fn: extern "C" fn(usize, *const *const u8) -> ! =
+        // SAFETY: We ensure that the entry_point is a valid function pointer.
+        unsafe { core::mem::transmute(entry_point) };
+    entry_fn(argc, argv.as_ptr());
 }
 
 #[entry]
@@ -59,6 +59,7 @@ fn main() -> Status {
     let binary = fs.read(path.as_ref()).unwrap();
     info!("Read mini_visor, size {}", binary.len());
 
+    let mut elf_base: Option<usize> = None;
     let elf_header = elf::Elf64Header::new(binary.as_ptr() as usize).expect("Invalid ELF Header");
     for p in elf_header.get_program_headers() {
         if p.get_segment_type() == elf::ELF_PROGRAM_HEADER_SEGMENT_LOAD {
@@ -66,6 +67,11 @@ fn main() -> Status {
             let mem_size = p.get_memory_size();
             let offset = p.get_offset();
             let file_size = p.get_file_size();
+
+            // Assume the first LOAD segment's physical address as the ELF base address
+            if elf_base.is_none() {
+                elf_base = Some(phys_addr as usize);
+            }
 
             info!(
                 "Loading segment: phys_addr={:#x}, mem_size={:#x}, offset={:#x}, file_size={:#x}",
@@ -102,7 +108,10 @@ fn main() -> Status {
         }
     }
 
-    // TODO: ローダの `extern "C" fn main(argc: usize, argv: *const *const u8) -> usize`に合わせて呼び出す
+    let elf_base = elf_base.expect("Failed to find ELF base address");
+
+    let entry_point = elf_header.get_entry_point() as usize;
+    info!("ELF entry point at address {:#x}", entry_point);
 
     const DTB_TABLE_GUID: uefi::Guid = guid!("B1B621D5-F19C-41A5-830B-D9152C69AAE0");
 
@@ -113,12 +122,12 @@ fn main() -> Status {
                     "Found DTB table entry at {:p}",
                     i as *const ConfigTableEntry
                 );
-                boot(i);
+                boot(elf_base, entry_point, i);
             }
         }
     });
 
     info!("DTB table not found");
 
-    Status::SUCCESS
+    Status::NOT_FOUND
 }
