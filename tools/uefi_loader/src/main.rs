@@ -24,7 +24,7 @@ pub fn get_currentel() -> u64 {
 
 fn boot(elf_base: usize, entry_point: usize, dtb_entry: &ConfigTableEntry) -> ! {
     let dtb_ptr = dtb_entry.address as *const u8;
-    info!("Booting with DTB at address {:p}", dtb_ptr as *const u8);
+    info!("Booting with DTB at address {dtb_ptr:p}");
 
     let argv: [*const u8; 3] = [dtb_ptr, elf_base as *const u8, core::ptr::null()];
     let argc = argv.len() - 1;
@@ -46,7 +46,7 @@ fn main() -> Status {
         error!("Current EL must be EL2");
         return Status::UNSUPPORTED;
     }
-    info!("Current EL: {:#x}", current_el);
+    info!("Current EL: {current_el:#x}");
 
     let path: CString16 = CString16::try_from("mini_visor").unwrap();
     let fs: ScopedProtocol<SimpleFileSystem> =
@@ -74,8 +74,7 @@ fn main() -> Status {
             }
 
             info!(
-                "Loading segment: phys_addr={:#x}, mem_size={:#x}, offset={:#x}, file_size={:#x}",
-                phys_addr, mem_size, offset, file_size
+                "Loading segment: phys_addr={phys_addr:#x}, mem_size={mem_size:#x}, offset={offset:#x}, file_size={file_size:#x}",
             );
 
             if offset + file_size > binary.len() as u64 {
@@ -89,7 +88,7 @@ fn main() -> Status {
             }
 
             const PAGE_SIZE: u64 = 0x1000;
-            let num_pages = (mem_size + PAGE_SIZE - 1) / PAGE_SIZE;
+            let num_pages = u64::div_ceil(mem_size, PAGE_SIZE);
 
             let allocated_pages = boot::allocate_pages(
                 boot::AllocateType::Address(phys_addr),
@@ -111,7 +110,7 @@ fn main() -> Status {
     let elf_base = elf_base.expect("Failed to find ELF base address");
 
     let entry_point = elf_header.get_entry_point() as usize;
-    info!("ELF entry point at address {:#x}", entry_point);
+    info!("ELF entry point at address {entry_point:#x}");
 
     const DTB_TABLE_GUID: uefi::Guid = guid!("B1B621D5-F19C-41A5-830B-D9152C69AAE0");
 
