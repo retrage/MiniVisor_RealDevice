@@ -1,12 +1,20 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
-use core::time::Duration;
-use log::info;
-use uefi::guid;
-use uefi::prelude::*;
-use uefi::{system::with_config_table, table::cfg::ConfigTableEntry};
+use core::{arch::asm, ptr::NonNull};
+use log::{error, info};
+use uefi::{
+    CString16,
+    boot::{self, ScopedProtocol},
+    fs::FileSystem,
+    guid,
+    prelude::*,
+    proto::media::fs::SimpleFileSystem,
+    system::with_config_table,
+    table::cfg::ConfigTableEntry,
+};
+
+mod elf;
 
 pub fn get_currentel() -> u64 {
     let currentel: u64;
@@ -31,10 +39,70 @@ fn boot(dtb_entry: &ConfigTableEntry) -> ! {
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
-    info!("Hello world!");
+    info!("MiniVisor UEFI Loader");
 
     let current_el = get_currentel() >> 2 & 0b11;
+    if current_el != 2 {
+        error!("Current EL must be EL2");
+        return Status::UNSUPPORTED;
+    }
     info!("Current EL: {:#x}", current_el);
+
+    let path: CString16 = CString16::try_from("mini_visor").unwrap();
+    let fs: ScopedProtocol<SimpleFileSystem> =
+        boot::get_image_file_system(boot::image_handle()).unwrap();
+    let mut fs = FileSystem::new(fs);
+    if !fs.try_exists(path.as_ref()).unwrap() {
+        error!("mini_visor not found");
+        return Status::NOT_FOUND;
+    }
+    let binary = fs.read(path.as_ref()).unwrap();
+    info!("Read mini_visor, size {}", binary.len());
+
+    let elf_header = elf::Elf64Header::new(binary.as_ptr() as usize).expect("Invalid ELF Header");
+    for p in elf_header.get_program_headers() {
+        if p.get_segment_type() == elf::ELF_PROGRAM_HEADER_SEGMENT_LOAD {
+            let phys_addr = p.get_physical_address();
+            let mem_size = p.get_memory_size();
+            let offset = p.get_offset();
+            let file_size = p.get_file_size();
+
+            info!(
+                "Loading segment: phys_addr={:#x}, mem_size={:#x}, offset={:#x}, file_size={:#x}",
+                phys_addr, mem_size, offset, file_size
+            );
+
+            if offset + file_size > binary.len() as u64 {
+                error!("Segment exceeds binary size");
+                return Status::LOAD_ERROR;
+            }
+
+            if mem_size < file_size {
+                error!("Segment memory size is smaller than file size");
+                return Status::LOAD_ERROR;
+            }
+
+            const PAGE_SIZE: u64 = 0x1000;
+            let num_pages = (mem_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            let allocated_pages = boot::allocate_pages(
+                boot::AllocateType::Address(phys_addr),
+                boot::MemoryType::LOADER_CODE,
+                num_pages as usize,
+            )
+            .expect("Failed to allocate pages for the segment");
+
+            let src_ptr =
+                NonNull::new((binary.as_ptr() as usize + offset as usize) as *mut u8).unwrap();
+
+            // SAFETY: We have allocated enough pages for the segment.
+            unsafe {
+                allocated_pages.copy_from(src_ptr, file_size as usize);
+            }
+        }
+    }
+
+    // TODO: ローダの `extern "C" fn main(argc: usize, argv: *const *const u8) -> usize`に合わせて呼び出す
 
     const DTB_TABLE_GUID: uefi::Guid = guid!("B1B621D5-F19C-41A5-830B-D9152C69AAE0");
 
