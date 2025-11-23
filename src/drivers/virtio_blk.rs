@@ -5,20 +5,9 @@
 
 use crate::drivers::virtio::*;
 
-pub const VIRTIO_BLK_TYPE_IN: u32 = 0;
-pub const VIRTIO_BLK_TYPE_OUT: u32 = 1;
-pub const VIRTIO_BLK_S_OK: u8 = 0;
-pub const VIRTIO_BLK_S_IOERR: u8 = 1;
-
 /// ディスクがRead Onlyかどうか
 const VIRTIO_BLK_F_RO: u32 = 1 << 5;
 
-#[repr(C)]
-pub struct VirtioBlkReq {
-    pub req_type: u32,
-    pub reserved: u32,
-    pub sector: u64,
-}
 
 pub struct VirtioBlk {
     base_address: usize,

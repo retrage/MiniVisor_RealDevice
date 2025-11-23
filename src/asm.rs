@@ -349,7 +349,7 @@ pub fn flush_data_cache_all() {
             0b001 => {
                 continue; /* Instruction Cache Only */
             }
-            0b010 | 0b011 | 0b100 => { /* Has data cache */ }
+            0b010..=0b100 => { /* Has data cache */ }
             _ => {
                 /* Unknown Cache Type */
                 continue;

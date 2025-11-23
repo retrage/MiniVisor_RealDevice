@@ -2,17 +2,42 @@
 //! Virtio-Blk MMIO Driver
 //!
 
-use crate::drivers::{virtio::*, virtio_blk::*};
-use crate::fat32::FileInfo;
+use crate::drivers::virtio::*;
 use crate::vm::*;
-use crate::{DW_MMC_BLK, FAT32};
 
 use core::ptr::{null_mut, read_volatile, write_volatile};
 
+pub const VIRTIO_BLK_TYPE_IN: u32 = 0;
+pub const VIRTIO_BLK_TYPE_OUT: u32 = 1;
+pub const VIRTIO_BLK_S_OK: u8 = 0;
+pub const VIRTIO_BLK_S_IOERR: u8 = 1;
+
 const VIRTIO_BLK_INT_ID: u32 = 40;
+
+#[repr(C)]
+pub struct VirtioBlkReq {
+    pub req_type: u32,
+    pub reserved: u32,
+    pub sector: u64,
+}
+
+pub struct FileInfo {
+    path: uefi::CString16,
+    file_size: u32,
+}
+
+impl FileInfo {
+    pub fn new(path: uefi::CString16, file_size: u32) -> Self {
+        Self { path, file_size }
+    }
+    pub fn get_file_size(&self) -> usize {
+        self.file_size as usize
+    }
+}
 
 pub struct VirtioBlkMmio {
     file: FileInfo,
+    buffered_data: alloc::vec::Vec<u8>,
     interrupt_status: u32,
     status: u32,
     queue_size: usize,
@@ -33,8 +58,13 @@ impl VirtioBlkMmio {
                 file.get_file_size()
             );
         }
+        let fs: uefi::boot::ScopedProtocol<uefi::proto::media::fs::SimpleFileSystem> =
+            uefi::boot::get_image_file_system(uefi::boot::image_handle()).unwrap();
+        let mut fs = uefi::fs::FileSystem::new(fs);
+        let file_path = file.path.clone();
         Self {
             file,
+            buffered_data: fs.read(file_path.as_ref()).unwrap(),
             interrupt_status: 0,
             status: 0,
             queue_size: 0,
@@ -158,22 +188,35 @@ impl VirtioBlkMmio {
                     status = VIRTIO_BLK_S_IOERR;
                     continue;
                 };
-                let mut virtio_blk = DW_MMC_BLK.lock();
-                let fat32 = unsafe { (&raw mut FAT32).as_mut().unwrap().assume_init_mut() };
-                let result = if is_write {
-                    fat32.write(&self.file, &mut virtio_blk, address, offset, size as usize)
+                if is_write {
+                    let data =
+                        unsafe { core::slice::from_raw_parts(address as *const u8, size as usize) };
+                    if offset + (size as usize) > self.buffered_data.len() {
+                        println!(
+                            "Write operation out of bounds: offset={:#X}, size={:#X}, file_size={:#X}",
+                            offset,
+                            size,
+                            self.buffered_data.len()
+                        );
+                        status = VIRTIO_BLK_S_IOERR;
+                    } else {
+                        self.buffered_data[offset..offset + (size as usize)].copy_from_slice(data);
+                    }
                 } else {
-                    fat32.read(&self.file, &mut virtio_blk, address, offset, size as usize)
-                };
-                if result.is_err() {
-                    println!(
-                        "Failed to {} {:#x} bytes from {:#x} to {:#x}",
-                        if is_write { "write" } else { "read" },
-                        size,
-                        offset,
-                        address
-                    );
-                    status = VIRTIO_BLK_S_IOERR;
+                    let data = unsafe {
+                        core::slice::from_raw_parts_mut(address as *mut u8, size as usize)
+                    };
+                    if offset + (size as usize) > self.buffered_data.len() {
+                        println!(
+                            "Read operation out of bounds: offset={:#X}, size={:#X}, file_size={:#X}",
+                            offset,
+                            size,
+                            self.buffered_data.len()
+                        );
+                        status = VIRTIO_BLK_S_IOERR;
+                    } else {
+                        data.copy_from_slice(&self.buffered_data[offset..offset + (size as usize)]);
+                    }
                 }
                 offset += size as usize;
             }

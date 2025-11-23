@@ -3,8 +3,7 @@
 //!
 
 use crate::asm;
-use crate::drivers::{dw_mmc::DwMmc, generic_timer, gicv3::GicRedistributor};
-use crate::fat32::Fat32;
+use crate::drivers::{generic_timer, gicv3::GicRedistributor};
 use crate::lock::Mutex;
 use crate::mmio::{
     gicv3::{GicDistributorMmio, GicRedistributorMmio},
@@ -151,19 +150,20 @@ impl MmioEntry {
     }
 }
 
-pub fn create_vm(
-    fat32: &Fat32,
-    blk: &mut DwMmc,
-    gic_redistributor: &GicRedistributor,
-) -> (usize, usize) {
+pub fn create_vm(gic_redistributor: &GicRedistributor) -> (usize, usize) {
     const RAM_VIRTUAL_BASE: usize = 0x40000000;
     /// RAM SIZE: 256MiB
     const RAM_SIZE: usize = 0x10000000;
     const ALIGN_SIZE: usize = 0x200000;
 
     /* 仮想マシンの基本要素の設定 */
-    let ram_physical_address = crate::allocate_pages(RAM_SIZE >> PAGE_SHIFT, PAGE_SHIFT)
-        .expect("Failed to allocate memory for VM.");
+    let ram_physical_address = uefi::boot::allocate_pages(
+        uefi::boot::AllocateType::AnyPages,
+        uefi::boot::MemoryType::LOADER_DATA,
+        RAM_SIZE >> PAGE_SHIFT,
+    )
+    .expect("Failed to allocate memory for VM.");
+    let ram_physical_address = ram_physical_address.addr().get();
     let vm_id = NEXT_VM_ID.fetch_add(1, Ordering::Relaxed);
     let cpu_mpidr = asm::get_mpidr_el1();
 
@@ -190,10 +190,16 @@ pub fn create_vm(
     mmio_handlers.push_back(MmioEntry::new(0x9000000, 0x1000, pl011_mmio.clone()));
 
     /* Virtio-Blk */
-    let file_name = [b'D', b'I', b'S', b'K', b'0' + vm_id as u8];
-    let disk_file = fat32
-        .search_file(core::str::from_utf8(&file_name).unwrap())
-        .expect("Failed to find Disk");
+    // let file_name = [b'D', b'I', b'S', b'K', b'0' + vm_id as u8];
+    let path = uefi::CString16::try_from("DISK0").unwrap();
+    let fs: uefi::boot::ScopedProtocol<uefi::proto::media::fs::SimpleFileSystem> =
+        uefi::boot::get_image_file_system(uefi::boot::image_handle()).unwrap();
+    let mut fs = uefi::fs::FileSystem::new(fs);
+    let metadata = fs
+        .metadata(path.as_ref())
+        .expect("Failed to get file metadata");
+    let disk_file =
+        crate::mmio::virtio_blk::FileInfo::new(path.clone(), metadata.file_size() as u32);
     mmio_handlers.push_back(MmioEntry::new(
         0xa000000,
         0x0200,
@@ -229,20 +235,35 @@ pub fn create_vm(
     );
 
     /* Linux KernelとDevicetreeの読み込み */
-    let kernel = fat32.search_file("IMAGE").unwrap();
-    let dtb = fat32.search_file("DTB").unwrap();
-    let dtb_size = dtb.get_file_size();
-    let kernel_size = kernel.get_file_size();
+    let kernel_path = uefi::CString16::try_from("IMAGE").unwrap();
+    let dtb_path = uefi::CString16::try_from("DTB").unwrap();
+
+    let kernel_size = fs
+        .metadata(kernel_path.as_ref())
+        .expect("Failed to get Kernel metadata")
+        .file_size() as usize;
+
+    let dtb_size = fs
+        .metadata(dtb_path.as_ref())
+        .expect("Failed to get DTB metadata")
+        .file_size() as usize;
+
     let kernel_virtual_address =
         ((RAM_VIRTUAL_BASE + dtb_size - 1) & !(ALIGN_SIZE - 1)) + ALIGN_SIZE;
     let kernel_physical_address = vm.get_physical_address(kernel_virtual_address).unwrap();
 
-    fat32
-        .read(&dtb, blk, ram_physical_address, 0, dtb_size)
-        .expect("Failed to read DTB");
-    fat32
-        .read(&kernel, blk, kernel_physical_address, 0, kernel_size)
-        .expect("Failed to read Kernel");
+    let kernel_data = fs
+        .read(kernel_path.as_ref())
+        .expect("Failed to read kernel data");
+    let dtb_data = fs.read(dtb_path.as_ref()).expect("Failed to read DTB data");
+
+    // Copy data to memory
+    let dtb_slice =
+        unsafe { core::slice::from_raw_parts_mut(ram_physical_address as *mut u8, dtb_size) };
+    let kernel_slice =
+        unsafe { core::slice::from_raw_parts_mut(kernel_physical_address as *mut u8, kernel_size) };
+    dtb_slice.copy_from_slice(&dtb_data);
+    kernel_slice.copy_from_slice(&kernel_data);
 
     /* Linux Kernel Headerの解析 */
     let header = unsafe { &*(kernel_physical_address as *const KernelHeader) };

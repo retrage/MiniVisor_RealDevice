@@ -295,7 +295,7 @@ impl Dtb {
             match self._search_node(node_name, &mut pointer, address_cells, size_cells) {
                 Ok(Some(n)) => return Some(n),
                 Ok(None) => {
-                    match self.read_node(pointer).map(|n| *n) {
+                    match self.read_node(pointer).copied() {
                         Ok(Self::FDT_END) | Err(_) => {
                             return None;
                         }
@@ -426,7 +426,7 @@ impl Dtb {
             ) {
                 Ok(Some(n)) => return Some(n),
                 Ok(None) => {
-                    match self.read_node(pointer).map(|n| *n) {
+                    match self.read_node(pointer).copied() {
                         Ok(Self::FDT_END) | Err(_) => {
                             return None;
                         }

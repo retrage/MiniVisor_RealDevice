@@ -51,7 +51,7 @@ global_asm!(
     "
 .section .text
 .balign 0x800
-.size   exception_table, 0x800
+// .size   exception_table, 0x800
 .global exception_table
 exception_table:
 
@@ -262,9 +262,7 @@ fn data_abort_handler(registers: &mut Registers, esr_el2: u64) {
 extern "C" fn irq_handler() {
     let (interrupt_number, group) = GicRedistributor::get_acknowledge();
     let mut deactivate = true;
-    if interrupt_number == unsafe { crate::DW_APB_UART_INT_ID } {
-        crate::handle_input(&crate::DW_APB_UART_DEVICE);
-    } else if interrupt_number == vgic::MAINTENANCE_INTERRUPT_INTID {
+    if interrupt_number == vgic::MAINTENANCE_INTERRUPT_INTID {
         vgic::maintenance_interrupt_handler();
     } else if interrupt_number == gicv3::INJECT_INTERRUPT_INT_ID {
         gicv3::inject_interrupt_handler();

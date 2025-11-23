@@ -2,7 +2,8 @@
 //! Stage2 Pagingの実装
 //!
 
-use crate::allocate_pages;
+use log::warn;
+
 use crate::asm;
 use crate::registers::*;
 
@@ -101,8 +102,20 @@ pub fn init_stage2_translation_table() {
         _ => (16u64, 0i8),
     };
     let number_of_tables = number_of_concatenated_page_tables(t0sz as u8, initial_lookup_level);
-    let table = allocate_pages(number_of_tables, 12 + number_of_tables - 1).unwrap();
-    for d in unsafe { from_raw_parts_mut(table as *mut Descriptor, number_of_tables * 512) } {
+    // TODO: Force alignment to number_of_tables - 1
+    let table = uefi::boot::allocate_pages(
+        uefi::boot::AllocateType::AnyPages,
+        uefi::boot::MemoryType::LOADER_DATA,
+        number_of_tables,
+    )
+    .expect("Failed to allocate memory");
+    if table.addr().get() & ((number_of_tables * 4096) - 1) != 0 {
+        warn!("Failed to allocate aligned memory for stage2 translation table");
+    }
+    let table = table.addr().get();
+    for d in unsafe {
+        from_raw_parts_mut::<Descriptor>(table as *mut Descriptor, number_of_tables * 512)
+    } {
         d.init();
     }
 
@@ -183,12 +196,16 @@ fn _map_address_stage2(
         }
 
         /* Table descriptor */
-        let mut next_level_table_address = descriptor.get_next_level_table_address();
+        let next_level_table_address = descriptor.get_next_level_table_address();
         if !descriptor.is_table_descriptor() {
             /* Translation table の作成 */
-            next_level_table_address = allocate_pages(1, 12).map_err(|e| {
-                println!("Failed to allocate new translation table: {:?}", e);
-            })?;
+            let next_level_table_address = uefi::boot::allocate_pages(
+                uefi::boot::AllocateType::AnyPages,
+                uefi::boot::MemoryType::LOADER_DATA,
+                1,
+            )
+            .expect("Failed to allocate new translation table");
+            let next_level_table_address = next_level_table_address.addr().get();
             for d in unsafe { from_raw_parts_mut(next_level_table_address as *mut Descriptor, 512) }
             {
                 d.init();

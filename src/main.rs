@@ -9,18 +9,13 @@ mod asm;
 mod console;
 mod dtb;
 mod drivers {
-    pub mod dw_apb_uart;
-    pub mod dw_mmc;
     pub mod generic_timer;
     pub mod gicv3;
     pub mod virtio;
-    pub mod virtio_blk;
 }
 mod elf;
 mod exception;
-mod fat32;
 mod lock;
-mod memory_allocator;
 mod mmio {
     pub mod gicv3;
     pub mod pl011;
@@ -32,29 +27,17 @@ mod registers;
 mod vgic;
 mod vm;
 
-use drivers::{dw_apb_uart, dw_mmc, generic_timer, gicv3};
+use uefi::entry;
+
+use drivers::{generic_timer, gicv3};
 use lock::Mutex;
 use psci::PsciErrorCodes;
 use serial::SerialDevice;
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::ffi::CStr;
 use core::mem::MaybeUninit;
-use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-struct GlobalAllocator {}
-
 /// グローバル変数置き場
-static DW_APB_UART_DEVICE: Mutex<dw_apb_uart::DwApbUart> =
-    Mutex::new(dw_apb_uart::DwApbUart::invalid());
-static mut DW_APB_UART_INT_ID: u32 = 0;
-static MEMORY_ALLOCATOR: Mutex<memory_allocator::MemoryAllocator> =
-    Mutex::new(memory_allocator::MemoryAllocator::new());
-static DW_MMC_BLK: Mutex<dw_mmc::DwMmc> = Mutex::new(dw_mmc::DwMmc::invalid());
-static mut FAT32: MaybeUninit<fat32::Fat32> = MaybeUninit::uninit();
-#[global_allocator]
-static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {};
 static CONSOLE: Mutex<console::Console> = Mutex::new(console::Console::new());
 static IS_CONSOLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
@@ -63,27 +46,27 @@ static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
 const STACK_SIZE: usize = 0x10000;
 const CONSOLE_SWITCH_KEY: u8 = 0x13; /* Ctrl + S */
 
-#[unsafe(no_mangle)]
-extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
-    let stack_pointer = asm::get_stack_pointer() as usize;
-    if argc != 2 {
-        return 1;
-    }
-    let args = unsafe { slice::from_raw_parts(argv, argc) };
-    /* argv[0] は DTB */
-    let Ok(arg_0) = unsafe { CStr::from_ptr(args[0]) }.to_str() else {
-        /* 変換に失敗 */
-        return 2;
-    };
-    let Some(dtb_address) = str_to_usize(arg_0) else {
-        return 3;
-    };
-    let Ok(dtb) = dtb::Dtb::new(dtb_address) else {
-        return 4;
-    };
-    if let Err(e) = init_serial_port(&dtb) {
-        return e;
-    }
+#[entry]
+fn main() -> uefi::Status {
+    uefi::helpers::init().unwrap();
+
+    const DTB_TABLE_GUID: uefi::Guid = uefi::guid!("B1B621D5-F19C-41A5-830B-D9152C69AAE0");
+
+    let mut dtb: Option<dtb::Dtb> = None;
+    uefi::system::with_config_table(|slice| {
+        for i in slice {
+            if let DTB_TABLE_GUID = i.guid {
+                log::info!(
+                    "Found DTB table entry at {:p}",
+                    i as *const uefi::table::cfg::ConfigTableEntry
+                );
+                dtb = Some(dtb::Dtb::new(i.address as usize).unwrap());
+                break;
+            }
+        }
+    });
+
+    let dtb = dtb.expect("DTB is not found in the UEFI Config Table");
 
     println!("Hello, world!");
 
@@ -91,32 +74,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     println!("CurrentEL: {}", current_el);
     assert_eq!(current_el, 2);
 
-    /* メモリ管理のセットアップ */
-    /* argv[1] は ELFヘッダの位置 */
-    let arg_1 = unsafe { CStr::from_ptr(args[1]) }
-        .to_str()
-        .expect("Failed to get argv[1]");
-    let elf_address = str_to_usize(arg_1).expect("Failed to convert the address");
-    setup_memory(&dtb, dtb_address, elf_address, stack_pointer);
-
     exception::setup_exception();
-    let distributor = init_gic_distributor(&dtb);
+    let _distributor = init_gic_distributor(&dtb);
     let redistributor = init_gic_redistributor(&dtb);
-
-    enable_serial_port_interrupt(&DW_APB_UART_DEVICE.lock(), &distributor);
 
     generic_timer::init_generic_timer_global(&dtb);
 
-    let mut dw_mmc = init_dw_mmc(&dtb).unwrap();
-    let fat32 = init_fat32(&mut dw_mmc);
-
-    let (boot_address, argument) = vm::create_vm(&fat32, &mut dw_mmc, &redistributor);
-
-    *DW_MMC_BLK.lock() = dw_mmc;
-    unsafe {
-        (&raw mut FAT32).as_mut().unwrap().write(fat32);
-        (&raw mut DTB).as_mut().unwrap().write(dtb);
-    }
+    let (boot_address, argument) = vm::create_vm(&redistributor);
 
     /* PSCIのバージョンチェック */
     let (major_version, minor_version) = psci::check_psci_version().expect("PSCI is not supported");
@@ -149,128 +113,6 @@ fn str_to_usize(s: &str) -> Option<usize> {
     usize::from_str_radix(start?, radix).ok()
 }
 
-fn init_serial_port(dtb: &dtb::Dtb) -> Result<(), usize> {
-    let mut dw_apb_uart = None;
-    loop {
-        dw_apb_uart = dtb.search_node_by_compatible(b"snps,dw-apb-uart", dw_apb_uart.as_ref());
-        match &dw_apb_uart {
-            Some(d) => {
-                if !dtb.is_node_operational(d) {
-                    continue;
-                } else {
-                    break;
-                }
-            }
-            None => {
-                return Err(5);
-            }
-        }
-    }
-    let dw_apb_uart = dw_apb_uart.unwrap();
-    let Some((dw_apb_uart_base, dw_apb_uart_range)) = dtb.read_reg_property(&dw_apb_uart, 0) else {
-        return Err(6);
-    };
-
-    let interrupts =
-        dtb.read_property_as_u32_array(&dtb.get_property(&dw_apb_uart, b"interrupts").unwrap());
-    let mut interrupt_number = 0;
-    if u32::from_be(interrupts[0]) == gicv3::DTB_GIC_SPI
-        && u32::from_be(interrupts[2]) == gicv3::DTB_GIC_LEVEL
-    {
-        interrupt_number = gicv3::GIC_SPI_BASE + u32::from_be(interrupts[1]);
-    }
-
-    let Ok(dw_apb_uart) = dw_apb_uart::DwApbUart::new(dw_apb_uart_base, dw_apb_uart_range) else {
-        return Err(7);
-    };
-    unsafe { DW_APB_UART_INT_ID = interrupt_number };
-    *DW_APB_UART_DEVICE.lock() = dw_apb_uart;
-    serial::init_default_serial_port(&DW_APB_UART_DEVICE);
-    Ok(())
-}
-
-#[panic_handler]
-pub fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("{info}");
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stack_pointer: usize) {
-    /* From `bdinfo` (8GiB) */
-    /* U-Boot 2025.04 */
-    let dram_list = [(0x200000, 0xefe00000), (0x100000000, 0x100000000)];
-    /* U-Boot 2017.09 (From https://github.com/hardkernel/u-boot.git) */
-    //let dram_list = [(0x0200000, 0x08200000), (0x09400000, 0xE6C00000)];
-
-    let mut memory_allocator = MEMORY_ALLOCATOR.lock();
-    for (start, size) in dram_list {
-        println!("RAM is [{:#X} ~ {:#X}]", start, start + size);
-        memory_allocator
-            .free(start, size)
-            .expect("Failed to free the RAM");
-    }
-
-    /* DTBを除外 */
-    println!(
-        "DTB is [{:#X} ~ {:#X}]",
-        dtb_address,
-        dtb_address + dtb.get_total_size()
-    );
-    memory_allocator
-        .reserve_memory(dtb_address, dtb.get_total_size(), 0)
-        .expect("Failed to reserve DTB");
-
-    let elf_header = elf::Elf64Header::new(elf_address).expect("Invalid ELF Header");
-    for p in elf_header.get_program_headers() {
-        if p.get_segment_type() == elf::ELF_PROGRAM_HEADER_SEGMENT_LOAD {
-            println!(
-                "Reserve [{:#X} ~ {:#X}]",
-                p.get_physical_address(),
-                p.get_physical_address() + p.get_memory_size()
-            );
-            memory_allocator
-                .reserve_memory(
-                    p.get_physical_address() as usize,
-                    p.get_memory_size() as usize,
-                    0,
-                )
-                .expect("Failed to reserve memory for the segment");
-        }
-    }
-
-    /* Stackを除外 */
-    let stack_end = ((stack_pointer - 1) & !(paging::PAGE_SIZE - 1)) + paging::PAGE_SIZE;
-    let stack_start = stack_end - STACK_SIZE;
-    println!("Reserve [{:#X} ~ {:#X}] for Stack", stack_start, stack_end);
-    memory_allocator
-        .reserve_memory(stack_start, STACK_SIZE, 0)
-        .expect("Failed to reserve memory for the stack");
-}
-
-pub fn allocate_pages(
-    number_of_pages: usize,
-    align: usize,
-) -> Result<usize, memory_allocator::MemoryError> {
-    match MEMORY_ALLOCATOR
-        .lock()
-        .allocate(number_of_pages << paging::PAGE_SHIFT, align)
-    {
-        Ok(a) => Ok(a),
-        Err(e) => {
-            println!("Failed to allocate memory: {:?}", e);
-            Err(e)
-        }
-    }
-}
-
-pub fn free_pages(address: usize, number_of_pages: usize) {
-    let _ = MEMORY_ALLOCATOR
-        .lock()
-        .free(address, number_of_pages << paging::PAGE_SHIFT);
-}
-
 fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv3::GicDistributor {
     let gic_node = dtb.search_node_by_compatible(b"arm,gic-v3", None).unwrap();
     let (base_address, size) = dtb.read_reg_property(&gic_node, 0).unwrap();
@@ -289,112 +131,17 @@ fn init_gic_redistributor(dtb: &dtb::Dtb) -> gicv3::GicRedistributor {
     gic_redistributor
 }
 
-fn enable_serial_port_interrupt(
-    dw_apb_uart: &dw_apb_uart::DwApbUart,
-    distributor: &gicv3::GicDistributor,
-) {
-    let int_id = unsafe { DW_APB_UART_INT_ID };
-    if int_id == 0 {
-        println!("DW UART does not support interrupt.");
-        return;
-    }
-    distributor.set_group(int_id, gicv3::GicGroup::NonSecureGroup1);
-    distributor.set_priority(int_id, 0x00);
-    distributor.set_routing(int_id, false, asm::get_mpidr_el1());
-    distributor.set_trigger_mode(int_id, true);
-    distributor.set_pending(int_id, false);
-    distributor.set_enable(int_id, true);
-    dw_apb_uart.enable_interrupt();
-}
-
-fn init_dw_mmc(dtb: &dtb::Dtb) -> Option<dw_mmc::DwMmc> {
-    let mut dw_mmc = None;
-    loop {
-        dw_mmc = dtb.search_node_by_compatible(b"rockchip,rk3568-dw-mshc", dw_mmc.as_ref());
-        match &dw_mmc {
-            Some(dw_mmc) => {
-                if dtb.is_node_operational(dw_mmc) {
-                    let (base_address, size) = dtb.read_reg_property(dw_mmc, 0).unwrap();
-                    let mut fifo_depth = 0;
-                    if let Some(depth) = dtb.get_property(dw_mmc, b"fifo-depth") {
-                        if let Some(depth) = dtb.read_property_as_u32(&depth) {
-                            fifo_depth = u32::from_be(depth);
-                        }
-                    }
-                    if let Ok(blk) = dw_mmc::DwMmc::new(base_address, size, fifo_depth) {
-                        return Some(blk);
-                    }
-                }
-            }
-            None => {
-                return None;
-            }
-        }
-    }
-}
-
-pub fn init_fat32(blk: &mut dw_mmc::DwMmc) -> fat32::Fat32 {
-    #[repr(C)]
-    struct PartitionTableEntry {
-        boot_flag: u8,
-        first_sector: [u8; 3],
-        partition_type: u8,
-        last_sector: [u8; 3],
-        first_sector_lba: u32,
-        number_of_sectors: u32,
-    }
-    const PARTITION_TABLE_BASE: usize = 0x1BE;
-    /* MBRの読み込み */
-    let mut mbr: [u8; 512] = [0; 512];
-    blk.read(&mut mbr as *mut _ as usize, 0, 512)
-        .expect("Failed to read first 512bytes");
-    /* BOOT Signatureの確認 */
-    assert_eq!(u16::from_le_bytes([mbr[510], mbr[511]]), 0xAA55);
-
-    /* パーテイションテーブルの解析 */
-    let partition_table = unsafe {
-        &*(&mbr[PARTITION_TABLE_BASE] as *const _ as usize as *const [PartitionTableEntry; 4])
-    };
-    let mut fat32 = Err(());
-    for e in partition_table {
-        if e.partition_type == 0x0C {
-            fat32 = fat32::Fat32::new(blk, e.first_sector_lba as usize, 512);
-            break;
-        }
-    }
-
-    let fat32 = fat32.expect("The FAT32 Partition is not found!");
-    fat32.list_files();
-
-    fat32
-}
-
-unsafe impl GlobalAlloc for GlobalAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        match MEMORY_ALLOCATOR
-            .lock()
-            .allocate(layout.size(), layout.align())
-        {
-            Ok(address) => address as *mut u8,
-            Err(e) => {
-                println!("Failed to allocate memory: {:?}", e);
-                core::ptr::null_mut()
-            }
-        }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let _ = MEMORY_ALLOCATOR.lock().free(ptr as usize, layout.size());
-    }
-}
-
 pub fn launch_cpu() -> bool {
     let dtb = unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() };
     let mut cpu_node = None;
     let current_affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
-    let stack_address = allocate_pages(STACK_SIZE >> paging::PAGE_SHIFT, 0)
-        .expect("Failed to allocate memory")
-        + STACK_SIZE;
+    let stack_base = uefi::boot::allocate_pages(
+        uefi::boot::AllocateType::AnyPages,
+        uefi::boot::MemoryType::LOADER_DATA,
+        STACK_SIZE >> paging::PAGE_SHIFT,
+    )
+    .expect("Failed to allocate memory");
+    let stack_address = stack_base.addr().get() + STACK_SIZE;
 
     /* Copy registers controlling the paging */
     use core::ptr::write_volatile;
@@ -402,7 +149,7 @@ pub fn launch_cpu() -> bool {
         write_volatile((stack_address - 8 * 4) as *mut u64, asm::get_tcr_el2());
         write_volatile((stack_address - 8 * 3) as *mut u64, asm::get_ttbr0_el2());
         write_volatile((stack_address - 8 * 2) as *mut u64, asm::get_mair_el2());
-        write_volatile((stack_address - 8 * 1) as *mut u64, asm::get_sctlr_el2());
+        write_volatile((stack_address - 8) as *mut u64, asm::get_sctlr_el2());
     }
     asm::flush_data_cache_all();
 
@@ -424,7 +171,9 @@ pub fn launch_cpu() -> bool {
         }
         cpu_node = Some(cpu);
     }
-    free_pages(stack_address - STACK_SIZE, STACK_SIZE >> paging::PAGE_SHIFT);
+    unsafe {
+        let _ = uefi::boot::free_pages(stack_base, STACK_SIZE >> paging::PAGE_SHIFT);
+    };
     false
 }
 
@@ -436,14 +185,11 @@ extern "C" fn core_main() -> ! {
     let redistributor =
         init_gic_redistributor(unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() });
 
-    let (boot_address, argument) = vm::create_vm(
-        unsafe { (&raw const FAT32).as_ref().unwrap().assume_init_ref() },
-        &mut DW_MMC_BLK.lock(),
-        &redistributor,
-    );
+    let (boot_address, argument) = vm::create_vm(&redistributor);
     vm::boot_vm(boot_address, argument)
 }
 
+#[allow(dead_code)]
 fn handle_input(device: &Mutex<dyn SerialDevice>) {
     loop {
         let c = device.lock().getc();

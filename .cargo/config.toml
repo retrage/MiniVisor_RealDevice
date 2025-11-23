@@ -1,5 +1,5 @@
 [build]
-target = "aarch64-unknown-none-softfloat"
+target = "aarch64-unknown-uefi"
 
 [target.aarch64-unknown-none-softfloat]
 rustflags = ["-C", "link-arg=-Tscripts/m1s.ld"]
