@@ -203,7 +203,7 @@ pub fn create_vm(gic_redistributor: &GicRedistributor) -> (usize, usize) {
     mmio_handlers.push_back(MmioEntry::new(
         0xa000000,
         0x0200,
-        Arc::new(Mutex::new(VirtioBlkMmio::new(disk_file))),
+        Arc::new(Mutex::new(VirtioBlkMmio::new(&mut fs, disk_file))),
     ));
 
     /* GIC Distributor */

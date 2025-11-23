@@ -51,16 +51,13 @@ pub struct VirtioBlkMmio {
 }
 
 impl VirtioBlkMmio {
-    pub fn new(file: FileInfo) -> Self {
+    pub fn new(fs: &mut uefi::fs::FileSystem, file: FileInfo) -> Self {
         if (file.get_file_size() & 0x1FF) != 0 {
             panic!(
                 "File Size must be 512-Byte aligned(Size: {:#X})",
                 file.get_file_size()
             );
         }
-        let fs: uefi::boot::ScopedProtocol<uefi::proto::media::fs::SimpleFileSystem> =
-            uefi::boot::get_image_file_system(uefi::boot::image_handle()).unwrap();
-        let mut fs = uefi::fs::FileSystem::new(fs);
         let file_path = file.path.clone();
         Self {
             file,
